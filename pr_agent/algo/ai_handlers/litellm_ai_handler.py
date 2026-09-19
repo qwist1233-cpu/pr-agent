@@ -2240,6 +2240,12 @@ class LiteLLMAIHandler(BaseAiHandler):
             [model.strip() for model in override] if override else CLAUDE_EXTENDED_THINKING_MODELS
         )
 
+        # Model ids to additionally treat as adaptive-only, for ids the built-in pattern cannot
+        # recognize (e.g. a Bedrock application inference profile ARN). Additive rather than
+        # replacing, so a named model elsewhere in the same fallback chain keeps its own detection.
+        self.claude_adaptive_thinking_models_override = self._load_claude_adaptive_thinking_models_override()
+        self._register_claude_adaptive_thinking_models(self.claude_adaptive_thinking_models_override)
+
         # Models that require streaming
         self.streaming_required_models = STREAMING_REQUIRED_MODELS
         self.force_streaming_provider = str(
@@ -3680,7 +3686,7 @@ class LiteLLMAIHandler(BaseAiHandler):
 
     def _claude_thinking_mode(self, model: str) -> str | None:
         """Return the thinking mode selected by request construction for this model."""
-        adaptive_model = self._is_claude_adaptive_thinking_model(model)
+        adaptive_model = self._model_uses_adaptive_thinking(model)
         if adaptive_model and self._claude_thinking_controls["enable_claude_adaptive_thinking"]:
             return "adaptive"
         if (
@@ -3852,6 +3858,59 @@ class LiteLLMAIHandler(BaseAiHandler):
         kwargs["temperature"] = 1
 
         return kwargs
+
+    @staticmethod
+    def _load_claude_adaptive_thinking_models_override() -> list[str]:
+        """Return the validated claude_adaptive_thinking_models_override list, or [] when malformed."""
+        override = get_settings().config.get("claude_adaptive_thinking_models_override", []) or []
+        if not isinstance(override, list):
+            get_logger().warning(
+                "Invalid claude_adaptive_thinking_models_override in config; expected a list of model names. "
+                "Falling back to the built-in Claude adaptive-thinking model detection."
+            )
+            return []
+        if not all(isinstance(model, str) and model.strip() for model in override):
+            get_logger().warning(
+                "Invalid claude_adaptive_thinking_models_override in config; "
+                "expected a list of model name strings. "
+                "Falling back to the built-in Claude adaptive-thinking model detection."
+            )
+            return []
+        # Store stripped names so exact-match checks against the model succeed even when the
+        # config entries contain surrounding whitespace.
+        return [model.strip() for model in override]
+
+    @staticmethod
+    def _register_claude_adaptive_thinking_models(models: list[str]) -> None:
+        """Declare the overridden Bedrock ids as adaptive-thinking models to LiteLLM.
+
+        LiteLLM's Bedrock transformations consult their own model map, and rewrite
+        thinking={"type": "adaptive"} to the legacy budget_tokens shape for ids the map does not
+        know, which Bedrock rejects for adaptive-only models. Registering the id keeps the
+        payload intact. Other providers forward the adaptive payload unchanged.
+        """
+        for model in models:
+            if not model.startswith("bedrock/"):
+                continue
+            try:
+                litellm.register_model({
+                    model: {
+                        "litellm_provider": "bedrock",
+                        "mode": "chat",
+                        "supports_adaptive_thinking": True,
+                    }
+                })
+            except Exception as e:
+                get_logger().warning(
+                    f"Failed to register {model} with LiteLLM as an adaptive-thinking model; "
+                    f"LiteLLM may downgrade its adaptive thinking payload: {e}"
+                )
+
+    def _model_uses_adaptive_thinking(self, model: str) -> bool:
+        """Return whether `model` is adaptive-only, by built-in detection or by config override."""
+        if model in getattr(self, "claude_adaptive_thinking_models_override", []):
+            return True
+        return self._is_claude_adaptive_thinking_model(model)
 
     @staticmethod
     def _is_claude_adaptive_thinking_model(model: str) -> bool:
@@ -4265,7 +4324,8 @@ class LiteLLMAIHandler(BaseAiHandler):
                     if "arn:aws:bedrock:" in model:
                         message += (
                             " For a Bedrock inference profile, address the model by name and pass "
-                            "the ARN with litellm.model_id."
+                            "the ARN with litellm.model_id, or list this id in "
+                            "claude_adaptive_thinking_models_override."
                         )
                     get_logger().warning(message)
 
